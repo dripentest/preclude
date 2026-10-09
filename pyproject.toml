@@ -1,0 +1,18 @@
+[project]
+name = "preclude"
+version = "0.1.0"
+description = "Scan a single endpoint's security headers and preclude attack classes that cannot work there."
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.27",
+]
+
+[project.scripts]
+preclude = "preclude.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["preclude"]
