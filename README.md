@@ -35,23 +35,56 @@ pip install -e .
 
 ## Usage
 
+One endpoint — full report:
+
 ```bash
 preclude scan https://target.example/api/v1/user
+```
+
+Many endpoints — ranked **priority map** (where to test first). Sources combine:
+positional URLs, a `--file`, or stdin (one URL per line, `#` comments allowed):
+
+```bash
+preclude scan https://a.example/login https://a.example/api/users
+preclude scan --file targets.txt
+cat targets.txt | preclude scan
 ```
 
 Options:
 
 | Flag | Meaning |
 |------|---------|
+| `-f, --file` | Read targets from a file (one URL per line). |
 | `-X, --method` | Primary request method (default `GET`). |
+| `-c, --concurrency` | Parallel requests in batch mode (default 10). |
+| `--json`       | Machine-readable JSON, ranked, instead of text. |
+| `--full`       | In batch mode, also print each full per-endpoint report. |
 | `--no-follow`  | Do not follow redirects; judge the first response. |
 | `--no-cors`    | Skip the foreign-`Origin` CORS probe. |
 | `-k, --insecure` | Do not verify TLS certificates. |
 | `--timeout`    | Per-request timeout, seconds (default 15). |
 
-Two requests are sent: the primary request (redirects followed to the final
-response, the hop chain is shown), and a CORS probe that repeats the request
-with a foreign `Origin` to detect reflection / `Allow-Credentials`.
+Two requests are sent per target: the primary request (redirects followed to the
+final response, the hop chain is shown), and a CORS probe that repeats the
+request with a foreign `Origin` to detect reflection / `Allow-Credentials`.
+
+### Priority map
+
+Each endpoint is scored by its remaining (non-precluded) attack surface, weighted
+by how interesting each class is to test; a probe-confirmed live finding (e.g.
+reflected CORS with credentials) counts most. Endpoints where the juicy classes
+are all `PRECLUDED` sink to the bottom.
+
+```
+PRIORITY MAP  (4 endpoints, sorted by remaining attack surface)
+
+score  open  rev  endpoint                top leads
+---------------------------------------------------
+   40     5    7  http://a.example        xss(open), clickjacking(open), mime-sniffing(open)
+   11     0    4  https://b.example       xss, csrf, xs-leaks
+
+legend: (!) probe-confirmed live finding   (open) no control present
+```
 
 ## Verdicts
 
@@ -105,11 +138,13 @@ likely exploitable rather than as a control.
 ```
 bin/preclude  standalone launcher (runs from a clone, no install)
 preclude/
-  probe.py    HTTP probing: primary request, redirect chain, cookies, CORS probe
-  csp.py      CSP parser + script-source weakness analysis
-  checks.py   one verdict function per attack class + the rule logic
-  report.py   strict monochrome rendering
-  cli.py      `preclude scan <url>`
+  probe.py      HTTP probing: primary request, redirect chain, cookies, CORS probe
+  csp.py        CSP parser + script-source weakness analysis
+  checks.py     one verdict function per attack class + the rule logic
+  batch.py      concurrent multi-endpoint scanning + target parsing
+  prioritize.py scoring and ranking of endpoints by remaining surface
+  report.py     strict monochrome rendering (single / priority map / JSON)
+  cli.py        `preclude scan <url> [<url> ...]`
 ```
 
 New classes/headers are added by writing a `check_*` function in `checks.py` and

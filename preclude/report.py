@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+
+from .batch import Result
 from .checks import OPEN, PRECLUDED, REVIEW, Verdict
 from .probe import Probe
+from . import prioritize
 
 _ORDER = [PRECLUDED, REVIEW, OPEN]
 _SECTION = {
@@ -49,3 +53,61 @@ def render(p: Probe, verdicts: list[Verdict]) -> str:
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _truncate(s: str, n: int) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def render_priority(results: list[Result]) -> str:
+    """Ranked map across many endpoints: where to test first."""
+    ranked = prioritize.rank(results)
+    ok = [t for t in ranked if t[0].error is None]
+    errs = [t for t in ranked if t[0].error is not None]
+
+    urlw = min(max((len(r.url) for r, _ in ranked), default=8), 54)
+    lines: list[str] = []
+    lines.append(f"PRIORITY MAP  ({len(results)} endpoints, sorted by remaining attack surface)")
+    lines.append("")
+    header = f"{'score':>5}  {'open':>4}  {'rev':>3}  {'endpoint'.ljust(urlw)}  top leads"
+    lines.append(header)
+    lines.append("-" * len(header))
+    for r, score in ok:
+        nopen = sum(1 for v in r.verdicts if v.status == OPEN)
+        nrev = sum(1 for v in r.verdicts if v.status == REVIEW)
+        leads = ", ".join(prioritize.top_leads(r.verdicts))
+        lines.append(f"{score:>5.0f}  {nopen:>4}  {nrev:>3}  {_truncate(r.url, urlw).ljust(urlw)}  {leads}")
+
+    if errs:
+        lines.append("")
+        lines.append("unreachable:")
+        for r, _ in errs:
+            lines.append(f"  {_truncate(r.url, urlw).ljust(urlw)}  {r.error}")
+
+    lines.append("")
+    lines.append("legend: (!) probe-confirmed live finding   (open) no control present")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _verdict_dict(v: Verdict) -> dict:
+    return {
+        "class": v.cls,
+        "status": v.status,
+        "evidence": v.evidence,
+        "note": v.note,
+        "exploitable": v.exploitable,
+    }
+
+
+def render_json(results: list[Result]) -> str:
+    out = []
+    for r, score in prioritize.rank(results):
+        out.append({
+            "url": r.url,
+            "final_url": r.probe.final_url,
+            "status": r.probe.status,
+            "error": r.error,
+            "score": round(score, 1),
+            "verdicts": [_verdict_dict(v) for v in r.verdicts],
+        })
+    return json.dumps(out, indent=2) + "\n"

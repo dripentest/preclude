@@ -29,6 +29,7 @@ class Verdict:
     status: str  # PRECLUDED | REVIEW | OPEN
     evidence: str  # header/value that drove the verdict (or "no relevant header")
     note: str = ""  # what to do / why, for REVIEW and OPEN
+    exploitable: bool = False  # the probe itself showed a likely-live finding
 
 
 def _get_csp(p: Probe) -> cspmod.CSP | None:
@@ -146,7 +147,8 @@ def check_cors(p: Probe) -> Verdict:
                        "same-origin policy blocks cross-origin reads")
     if c.reflected and c.acac:
         return Verdict(cls, REVIEW, f"ACAO reflects Origin + Allow-Credentials: true",
-                       "likely exploitable: any origin can read authenticated responses")
+                       "likely exploitable: any origin can read authenticated responses",
+                       exploitable=True)
     if c.reflected:
         return Verdict(cls, REVIEW, "ACAO reflects arbitrary Origin",
                        "cross-origin reads allowed (no credentials); exposure if data is sensitive")
