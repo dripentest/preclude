@@ -66,6 +66,18 @@ feroxbuster -u https://target.example --json -o ferox.json
 preclude scan -f ferox.json          # or:  cat ferox.json | preclude scan
 ```
 
+### Filtering by status code
+
+When the input carries a status (feroxbuster JSON or its text columns), filter
+which results to scan with `--include-status` / `--exclude-status`. Codes are
+exact or class wildcards (`2xx`). Targets with no known status (plain lists,
+JSON string arrays) always pass.
+
+```bash
+preclude scan -f ferox.json --include-status 200,204,301,401
+preclude scan -f ferox.json --exclude-status 4xx,5xx
+```
+
 Options:
 
 | Flag | Meaning |

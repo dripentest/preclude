@@ -26,6 +26,13 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="primary request method (default: GET)")
     scan.add_argument("-c", "--concurrency", type=int, default=10,
                       help="parallel requests in batch mode (default: 10)")
+    scan.add_argument("--include-status", metavar="CODES",
+                      help="keep only these status codes from status-bearing input "
+                           "(e.g. '200,204,301' or '2xx,3xx'); targets without a "
+                           "known status always pass")
+    scan.add_argument("--exclude-status", metavar="CODES",
+                      help="drop these status codes from status-bearing input "
+                           "(e.g. '404,500' or '4xx,5xx')")
     scan.add_argument("--timeout", type=float, default=15.0,
                       help="per-request timeout in seconds (default: 15)")
     scan.add_argument("--no-follow", action="store_true",
@@ -41,13 +48,13 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _collect_targets(args) -> list[str]:
+def _collect_targets(args, status_filter: batch.StatusFilter) -> list[str]:
     targets: list[str] = list(args.urls)  # explicit command-line URLs, as given
     if args.file:
         with open(args.file, encoding="utf-8") as fh:
-            targets.extend(batch.extract_targets(fh.read()))
+            targets.extend(batch.extract_targets(fh.read(), status_filter))
     if not args.urls and not args.file and not sys.stdin.isatty():
-        targets.extend(batch.extract_targets(sys.stdin.read()))
+        targets.extend(batch.extract_targets(sys.stdin.read(), status_filter))
     return batch.dedupe(targets)
 
 
@@ -59,7 +66,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 1
 
-    targets = _collect_targets(args)
+    try:
+        status_filter = batch.StatusFilter.parse(args.include_status, args.exclude_status)
+    except ValueError as exc:
+        sys.stderr.write(f"preclude: {exc}\n")
+        return 1
+
+    targets = _collect_targets(args, status_filter)
     if not targets:
         sys.stderr.write("preclude: no targets given (pass URLs, --file, or stdin)\n")
         return 1

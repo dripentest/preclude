@@ -60,66 +60,130 @@ def _urls_from_json(obj) -> list[str]:
     ``{"type": "response", "url": ...}``; non-response objects like statistics
     carry no ``url`` and are skipped), and lists of either.
     """
+    out: list[tuple[str, int | None]] = []
+    _pairs_from_json(obj, out)
+    return [url for url, _ in out]
+
+
+def _pairs_from_json(obj, out: list[tuple[str, int | None]]) -> None:
     if isinstance(obj, str):
-        return [obj]
-    if isinstance(obj, dict):
+        out.append((obj, None))
+    elif isinstance(obj, dict):
         if obj.get("type") not in (None, "response"):
-            return []
+            return
         url = obj.get("url")
-        return [url] if isinstance(url, str) else []
-    if isinstance(obj, list):
-        out: list[str] = []
+        if isinstance(url, str):
+            status = obj.get("status")
+            out.append((url, status if isinstance(status, int) else None))
+    elif isinstance(obj, list):
         for item in obj:
-            out.extend(_urls_from_json(item))
-        return out
-    return []
+            _pairs_from_json(item, out)
 
 
-def _url_from_text_line(line: str) -> str | None:
-    """Extract a target from one plain-text line.
+def _pair_from_text_line(line: str) -> tuple[str, int | None] | None:
+    """Extract (url, status) from one plain-text line.
 
     Handles a bare URL/host (a target list) and feroxbuster's column output
-    (``200  GET  120l  300w  4500c  https://host/path``) by taking the URL
-    token. A multi-field line with no URL token (a banner/header) is skipped.
+    (``200  GET  120l  300w  4500c  https://host/path``), taking the URL token
+    and the leading status code when present. A multi-field line with no URL
+    token (a banner/header) is skipped.
     """
     parts = line.split()
     http = [p for p in parts if p.startswith(("http://", "https://"))]
+    status = None
+    if parts and parts[0].isdigit() and 100 <= int(parts[0]) <= 599:
+        status = int(parts[0])
     if http:
-        return http[-1]
+        return (http[-1], status)
     if len(parts) == 1:
-        return parts[0]
+        return (parts[0], None)
     return None
 
 
-def extract_targets(text: str) -> list[str]:
+@dataclass
+class StatusFilter:
+    """Keep/drop targets by HTTP status when the input carries one.
+
+    Codes are exact (``200``) or class wildcards (``2xx``). Targets with no
+    known status (plain lists, JSON string arrays) always pass.
+    """
+    include_exact: set[int] = field(default_factory=set)
+    include_class: set[int] = field(default_factory=set)
+    exclude_exact: set[int] = field(default_factory=set)
+    exclude_class: set[int] = field(default_factory=set)
+
+    @staticmethod
+    def _parse(spec: str | None) -> tuple[set[int], set[int]]:
+        exact: set[int] = set()
+        klass: set[int] = set()
+        if not spec:
+            return exact, klass
+        for tok in spec.replace(",", " ").split():
+            t = tok.strip().lower()
+            if not t:
+                continue
+            if len(t) == 3 and t[0] in "12345" and t[1:] == "xx":
+                klass.add(int(t[0]))
+            elif t.isdigit() and 100 <= int(t) <= 599:
+                exact.add(int(t))
+            else:
+                raise ValueError(f"invalid status code '{tok}' (use e.g. 200, 301, 2xx)")
+        return exact, klass
+
+    @classmethod
+    def parse(cls, include: str | None, exclude: str | None) -> "StatusFilter":
+        ie, ic = cls._parse(include)
+        ee, ec = cls._parse(exclude)
+        return cls(ie, ic, ee, ec)
+
+    @property
+    def active(self) -> bool:
+        return bool(self.include_exact or self.include_class
+                    or self.exclude_exact or self.exclude_class)
+
+    def allows(self, status: int | None) -> bool:
+        if status is None:
+            return True  # status unknown for this input; cannot filter
+        if status in self.exclude_exact or (status // 100) in self.exclude_class:
+            return False
+        if self.include_exact or self.include_class:
+            return status in self.include_exact or (status // 100) in self.include_class
+        return True
+
+
+def extract_targets(text: str, status_filter: StatusFilter | None = None) -> list[str]:
     """Parse targets from file/stdin text, auto-detecting the format.
 
     Accepts a plain URL-per-line list (``#`` comments ok), a whole-document
     JSON array/object, and newline-delimited JSON (feroxbuster ``--json``).
+    When ``status_filter`` is given, targets whose input carries a status are
+    kept only if it passes the filter.
     """
+    sf = status_filter
+    pairs: list[tuple[str, int | None]] = []
+
     stripped = text.lstrip()
-    # Whole-document JSON (e.g. a pretty-printed array) — not NDJSON.
-    if stripped[:1] in "[{":
+    if stripped[:1] in "[{":  # whole-document JSON (e.g. a pretty-printed array)
         try:
-            return dedupe(_urls_from_json(json.loads(text)))
+            _pairs_from_json(json.loads(text), pairs)
+            return dedupe([u for u, s in pairs if sf is None or sf.allows(s)])
         except json.JSONDecodeError:
             pass  # likely NDJSON or mixed; fall through to per-line handling
 
-    out: list[str] = []
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         if line[:1] in "[{":  # a single NDJSON record
             try:
-                out.extend(_urls_from_json(json.loads(line)))
+                _pairs_from_json(json.loads(line), pairs)
                 continue
             except json.JSONDecodeError:
                 pass
-        url = _url_from_text_line(line)
-        if url:
-            out.append(url)
-    return dedupe(out)
+        pair = _pair_from_text_line(line)
+        if pair:
+            pairs.append(pair)
+    return dedupe([u for u, s in pairs if sf is None or sf.allows(s)])
 
 
 # Backwards-compatible alias: used to take an iterable of raw lines.
