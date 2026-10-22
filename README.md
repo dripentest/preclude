@@ -41,13 +41,29 @@ One endpoint — full report:
 preclude scan https://target.example/api/v1/user
 ```
 
-Many endpoints — ranked **priority map** (where to test first). Sources combine:
-positional URLs, a `--file`, or stdin (one URL per line, `#` comments allowed):
+Many endpoints — ranked **priority map** (where to test first). Targets come
+from positional URLs, a `--file`, or stdin:
 
 ```bash
 preclude scan https://a.example/login https://a.example/api/users
 preclude scan --file targets.txt
 cat targets.txt | preclude scan
+```
+
+### Input formats (`--file` / stdin), auto-detected
+
+- **URL-per-line** list (`#` comments and blank lines ignored).
+- **JSON array** of strings `["https://a/ep", ...]` or objects
+  `[{"url": "https://a/ep"}, ...]`.
+- **feroxbuster `--json`** output (NDJSON): `response` records are picked up by
+  their `url`, other records (config, statistics) are skipped.
+- **feroxbuster default text** output: the URL column is extracted per line.
+
+So a content-discovery run feeds straight in, no cleanup:
+
+```bash
+feroxbuster -u https://target.example --json -o ferox.json
+preclude scan -f ferox.json          # or:  cat ferox.json | preclude scan
 ```
 
 Options:

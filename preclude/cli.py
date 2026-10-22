@@ -19,7 +19,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     scan = sub.add_parser("scan", help="scan one or more endpoint URLs")
     scan.add_argument("urls", nargs="*", help="target URL(s); scheme defaults to https://")
-    scan.add_argument("-f", "--file", help="read targets from a file (one URL per line, # comments ok)")
+    scan.add_argument("-f", "--file",
+                      help="read targets from a file: URL-per-line list, JSON array, "
+                           "or feroxbuster --json (NDJSON); format auto-detected")
     scan.add_argument("-X", "--method", default="GET",
                       help="primary request method (default: GET)")
     scan.add_argument("-c", "--concurrency", type=int, default=10,
@@ -40,13 +42,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _collect_targets(args) -> list[str]:
-    raw: list[str] = list(args.urls)
+    targets: list[str] = list(args.urls)  # explicit command-line URLs, as given
     if args.file:
         with open(args.file, encoding="utf-8") as fh:
-            raw.extend(fh.readlines())
-    if not raw and not sys.stdin.isatty():
-        raw.extend(sys.stdin.readlines())
-    return batch.read_targets(raw)
+            targets.extend(batch.extract_targets(fh.read()))
+    if not args.urls and not args.file and not sys.stdin.isatty():
+        targets.extend(batch.extract_targets(sys.stdin.read()))
+    return batch.dedupe(targets)
 
 
 def main(argv: list[str] | None = None) -> int:
