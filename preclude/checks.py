@@ -104,15 +104,12 @@ def check_xss(p: Probe) -> Verdict:
     if not csp.enforced:
         return Verdict(cls, REVIEW, "Content-Security-Policy-Report-Only",
                        "CSP present but Report-Only, so it blocks nothing")
-    srcs = csp.script_sources()
-    if srcs is None:
-        return Verdict(cls, REVIEW, "CSP without script-src/default-src",
-                       "no script restriction; CSP does not constrain inline/remote JS")
-    weaknesses = cspmod.script_weaknesses(srcs)
+    weaknesses = cspmod.policy_weaknesses(csp)
     if weaknesses:
-        return Verdict(cls, REVIEW, "CSP script-src", "; ".join(weaknesses))
-    return Verdict(cls, REVIEW, "CSP script-src (strict)",
-                   "CSP looks strict; XSS exploitation is hard but DOM sinks / bypasses may remain")
+        return Verdict(cls, REVIEW, "CSP", "; ".join(weaknesses))
+    return Verdict(cls, REVIEW, "CSP (strict)",
+                   "CSP looks strict (script-src/object-src/base-uri/form-action locked); "
+                   "DOM sinks / bypasses may still remain")
 
 
 def check_csrf(p: Probe) -> Verdict:
@@ -135,6 +132,18 @@ def check_csrf(p: Probe) -> Verdict:
                    "cookies sent cross-site; test CSRF on state-changing requests")
 
 
+def _cors_preflight_note(c) -> str:
+    """Describe an over-permissive preflight, if any."""
+    bits = []
+    methods = (c.allow_methods or "")
+    headers = (c.allow_headers or "")
+    if "*" in methods or any(m in methods.upper() for m in ("PUT", "DELETE", "PATCH")):
+        bits.append(f"Allow-Methods: {methods.strip()}")
+    if headers.strip() == "*" or "authorization" in headers.lower():
+        bits.append(f"Allow-Headers: {headers.strip()}")
+    return "; ".join(bits)
+
+
 def check_cors(p: Probe) -> Verdict:
     cls = "cors"
     c = p.cors
@@ -142,16 +151,36 @@ def check_cors(p: Probe) -> Verdict:
         return Verdict(cls, REVIEW, "CORS not probed", "re-run without --no-cors to judge")
     if c.error:
         return Verdict(cls, REVIEW, "CORS probe failed", c.error)
-    if c.acao is None:
-        return Verdict(cls, PRECLUDED, "no Access-Control-Allow-Origin for foreign Origin",
-                       "same-origin policy blocks cross-origin reads")
+
+    # A crafted origin that got reflected is a concrete validator weakness.
+    crafted = [b for b in c.bypasses if b.kind != "reflected-any"]
+    if crafted:
+        with_creds = [b for b in crafted if b.acac]
+        worst = (with_creds or crafted)[0]
+        kinds = ", ".join(sorted({b.kind for b in crafted}))
+        if with_creds:
+            return Verdict(cls, REVIEW,
+                           f"weak Origin validation ({kinds}) + Allow-Credentials: true",
+                           f"exploitable: crafted origin {worst.origin} accepted with credentials",
+                           exploitable=True)
+        return Verdict(cls, REVIEW, f"weak Origin validation ({kinds})",
+                       f"crafted origin {worst.origin} reflected; cross-origin read if data is sensitive")
+
+    pre = _cors_preflight_note(c)
     if c.reflected and c.acac:
-        return Verdict(cls, REVIEW, f"ACAO reflects Origin + Allow-Credentials: true",
-                       "likely exploitable: any origin can read authenticated responses",
+        return Verdict(cls, REVIEW, "ACAO reflects Origin + Allow-Credentials: true",
+                       "likely exploitable: any origin can read authenticated responses"
+                       + (f"; permissive preflight ({pre})" if pre else ""),
                        exploitable=True)
     if c.reflected:
         return Verdict(cls, REVIEW, "ACAO reflects arbitrary Origin",
                        "cross-origin reads allowed (no credentials); exposure if data is sensitive")
+    if c.acao is None:
+        note = "same-origin policy blocks cross-origin reads"
+        if pre and c.preflight_acac:
+            return Verdict(cls, REVIEW, "no ACAO on GET, but preflight is permissive",
+                           f"{pre}; verify the actual (non-simple) request's CORS response")
+        return Verdict(cls, PRECLUDED, "no Access-Control-Allow-Origin for foreign Origin", note)
     if c.acao.strip() == "*":
         return Verdict(cls, REVIEW, "Access-Control-Allow-Origin: *",
                        "any origin can read; exposure if endpoint returns sensitive data")
@@ -159,7 +188,8 @@ def check_cors(p: Probe) -> Verdict:
         return Verdict(cls, REVIEW, "Access-Control-Allow-Origin: null",
                        "'null' is forgeable via sandboxed iframe; test cross-origin read")
     return Verdict(cls, PRECLUDED, f"Access-Control-Allow-Origin: {c.acao} (fixed, not reflected)",
-                   "foreign origins are not allowed")
+                   "foreign origins are not allowed"
+                   + (f"; note permissive preflight ({pre})" if pre else ""))
 
 
 def check_cookie_theft(p: Probe) -> Verdict:
@@ -281,6 +311,94 @@ def check_sensitive_caching(p: Probe) -> Verdict:
                    "verify sensitive data is not cached")
 
 
+def check_cookie_integrity(p: Probe) -> Verdict:
+    # Uses the __Host-/__Secure- cookie name prefixes.
+    cls = "cookie-integrity"
+    cookies = _session_cookies(p)
+    if not cookies:
+        return Verdict(cls, REVIEW, "no Set-Cookie observed", "no cookie integrity to assess")
+    host_pref = [c.name for c in cookies if c.prefix == "__host-"]
+    secure_pref = [c.name for c in cookies if c.prefix == "__secure-"]
+    plain = [c.name for c in cookies if not c.prefix]
+    if host_pref and not plain:
+        return Verdict(cls, PRECLUDED, f"__Host- prefix ({', '.join(host_pref)})",
+                       "scope locked to origin + Path=/ with no Domain; "
+                       "subdomain overwrite / session fixation prevented")
+    if host_pref or secure_pref:
+        used = host_pref + secure_pref
+        return Verdict(cls, REVIEW, f"partial cookie prefixes ({', '.join(used)})",
+                       f"other cookies ({', '.join(plain)}) lack a prefix and stay overwritable; test fixation")
+    return Verdict(cls, REVIEW, f"no __Host-/__Secure- prefix ({', '.join(plain)})",
+                   "cookie can be overwritten by a sibling subdomain; test session fixation / injection")
+
+
+def check_permissions_policy(p: Probe) -> Verdict:
+    cls = "permissions-policy"
+    pp = p.header("Permissions-Policy")
+    if pp:
+        permissive = any("=*" in d.replace(" ", "") or "=(*)" in d.replace(" ", "")
+                         for d in pp.split(","))
+        if permissive:
+            return Verdict(cls, REVIEW, f"Permissions-Policy: {pp}",
+                           "policy present but allows some feature to all origins ('*')")
+        return Verdict(cls, PRECLUDED, f"Permissions-Policy: {pp}",
+                       "powerful features restricted by policy")
+    fp = p.header("Feature-Policy")
+    if fp:
+        return Verdict(cls, REVIEW, f"Feature-Policy: {fp}",
+                       "legacy Feature-Policy; superseded by Permissions-Policy, patchy support")
+    return Verdict(cls, REVIEW, "no Permissions-Policy",
+                   "powerful features (camera/mic/geolocation/...) not restricted at header level")
+
+
+def check_coep(p: Probe) -> Verdict:
+    cls = "coep"
+    coep = p.header("Cross-Origin-Embedder-Policy")
+    if coep and coep.strip().lower() in ("require-corp", "credentialless"):
+        return Verdict(cls, PRECLUDED, f"Cross-Origin-Embedder-Policy: {coep}",
+                       "cross-origin isolation enabled; mitigates XS-leaks / Spectre-class reads")
+    return Verdict(cls, REVIEW, "no Cross-Origin-Embedder-Policy",
+                   "no cross-origin isolation; XS-leaks / Spectre-class not mitigated")
+
+
+def check_corp(p: Probe) -> Verdict:
+    cls = "corp"
+    corp = p.header("Cross-Origin-Resource-Policy")
+    if not corp:
+        return Verdict(cls, REVIEW, "no Cross-Origin-Resource-Policy",
+                       "resource embeddable cross-origin by default; relevant if it is sensitive")
+    v = corp.strip().lower()
+    if v in ("same-origin", "same-site"):
+        return Verdict(cls, PRECLUDED, f"Cross-Origin-Resource-Policy: {corp}",
+                       "resource not embeddable across origins")
+    if v == "cross-origin":
+        return Verdict(cls, OPEN, "Cross-Origin-Resource-Policy: cross-origin",
+                       "resource explicitly embeddable by any site")
+    return Verdict(cls, REVIEW, f"Cross-Origin-Resource-Policy: {corp}", "unrecognised value")
+
+
+def check_xss_legacy_filter(p: Probe) -> Verdict:
+    cls = "xss-legacy-filter"
+    x = p.header("X-XSS-Protection")
+    if x is None:
+        return Verdict(cls, PRECLUDED, "no X-XSS-Protection",
+                       "legacy auditor removed from modern browsers; not a factor")
+    if x.strip().lower().startswith("0"):
+        return Verdict(cls, PRECLUDED, f"X-XSS-Protection: {x}", "legacy filter correctly disabled")
+    return Verdict(cls, REVIEW, f"X-XSS-Protection: {x}",
+                   "deprecated filter enabled; can introduce XS-leak/oracle behaviour in old browsers")
+
+
+def check_clear_site_data(p: Probe) -> Verdict:
+    cls = "clear-site-data"
+    csd = p.header("Clear-Site-Data")
+    if csd:
+        return Verdict(cls, PRECLUDED, f"Clear-Site-Data: {csd}",
+                       "declarative state clearing present (logout hygiene)")
+    return Verdict(cls, REVIEW, "no Clear-Site-Data",
+                   "no declarative state clearing; verify logout invalidates the session server-side")
+
+
 ALL_CHECKS = [
     check_clickjacking,
     check_mime_sniffing,
@@ -289,10 +407,16 @@ ALL_CHECKS = [
     check_cors,
     check_cookie_theft,
     check_cookie_transport,
+    check_cookie_integrity,
     check_tls_downgrade,
     check_mixed_content,
     check_referrer_leak,
     check_xs_leaks,
+    check_coep,
+    check_corp,
+    check_permissions_policy,
+    check_xss_legacy_filter,
+    check_clear_site_data,
     check_info_disclosure,
     check_sensitive_caching,
 ]

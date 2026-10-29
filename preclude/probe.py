@@ -5,8 +5,10 @@ Two requests are made against the target:
   1. The primary request (default GET) whose response headers drive most checks.
      Redirects are followed to the final response unless disabled; the hop chain
      is recorded so the report can show it.
-  2. A CORS probe: the same URL requested with a foreign ``Origin`` header, so the
-     engine can see whether the server reflects the origin / allows credentials.
+  2. A CORS probe: a foreign ``Origin`` on a simple GET (reflection / credentials),
+     an ``OPTIONS`` preflight (allowed methods / headers), and a short fuzz of
+     crafted origins to expose weak Origin-validation (prefix / suffix / unescaped
+     dot / null).
 """
 
 from __future__ import annotations
@@ -34,11 +36,27 @@ class Cookie:
 
 
 @dataclass
+class CorsBypass:
+    """A crafted Origin the server accepted (reflected), i.e. a weak validator."""
+    origin: str
+    kind: str  # 'reflected-any' | 'prefix' | 'suffix' | 'unescaped-dot' | 'null'
+    acac: bool  # Access-Control-Allow-Credentials: true for this origin
+
+
+@dataclass
 class CorsResult:
     probed: bool = False
-    acao: str | None = None  # Access-Control-Allow-Origin
+    # Baseline: a plain foreign Origin on the primary method.
+    acao: str | None = None  # Access-Control-Allow-Origin echoed back
     acac: bool = False  # Access-Control-Allow-Credentials: true
-    reflected: bool = False  # ACAO echoes the foreign origin
+    reflected: bool = False  # ACAO echoes the foreign origin verbatim
+    # Preflight: OPTIONS with Access-Control-Request-Method/Headers.
+    preflight: bool = False
+    allow_methods: str | None = None  # Access-Control-Allow-Methods
+    allow_headers: str | None = None  # Access-Control-Allow-Headers
+    preflight_acac: bool = False
+    # Origin-validation fuzzing.
+    bypasses: list[CorsBypass] = field(default_factory=list)
     error: str | None = None
 
 
@@ -107,24 +125,74 @@ def _extract_set_cookies(resp: requests.Response) -> list[Cookie]:
     return [_parse_set_cookie(line) for line in lines if line]
 
 
+def _acac_true(resp: requests.Response) -> bool:
+    return (resp.headers.get("Access-Control-Allow-Credentials") or "").strip().lower() == "true"
+
+
+def _bypass_origins(url: str) -> list[tuple[str, str]]:
+    """Crafted (origin, kind) pairs that expose weak Origin validation.
+
+    The host does not need to resolve: we connect to the real target and only
+    vary the ``Origin`` header, so synthetic markers are fine and detectable.
+    """
+    host = (urlparse(url).hostname or "").lower()
+    out: list[tuple[str, str]] = [("null", "null")]
+    if not host:
+        return out
+    marker = "preclude-bypass.example"
+    # startsWith / "contains host" validators accept host as a subdomain prefix.
+    out.append((f"https://{host}.{marker}", "prefix"))
+    # endsWith validators accept a different registrable domain ending in host.
+    out.append((f"https://preclude{host}", "suffix"))
+    # Unescaped '.' in a regex matches any char, so a dash-for-dot host passes.
+    if "." in host:
+        out.append((f"https://{host.replace('.', '-')}", "unescaped-dot"))
+    return out
+
+
 def _cors_probe(session: requests.Session, url: str, timeout: float, verify: bool) -> CorsResult:
     result = CorsResult(probed=True)
+
+    # 1) Baseline: plain foreign Origin on a simple GET.
     try:
-        resp = session.get(
-            url,
-            timeout=timeout,
-            verify=verify,
-            allow_redirects=True,
-            headers={"Origin": PROBE_ORIGIN},
-        )
+        resp = session.get(url, timeout=timeout, verify=verify, allow_redirects=True,
+                           headers={"Origin": PROBE_ORIGIN})
     except requests.RequestException as exc:
         result.error = str(exc)
         return result
     acao = resp.headers.get("Access-Control-Allow-Origin")
-    acac = (resp.headers.get("Access-Control-Allow-Credentials") or "").strip().lower() == "true"
     result.acao = acao
-    result.acac = acac
+    result.acac = _acac_true(resp)
     result.reflected = acao is not None and acao.strip() == PROBE_ORIGIN
+    if result.reflected:
+        result.bypasses.append(CorsBypass(PROBE_ORIGIN, "reflected-any", result.acac))
+
+    # 2) Preflight: OPTIONS asking for a non-simple method + custom header.
+    try:
+        pre = session.options(url, timeout=timeout, verify=verify, allow_redirects=True, headers={
+            "Origin": PROBE_ORIGIN,
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "x-preclude-probe,authorization",
+        })
+        result.preflight = True
+        result.allow_methods = pre.headers.get("Access-Control-Allow-Methods")
+        result.allow_headers = pre.headers.get("Access-Control-Allow-Headers")
+        result.preflight_acac = _acac_true(pre)
+    except requests.RequestException:
+        pass  # preflight is best-effort; absence is itself informative
+
+    # 3) Fuzz crafted origins to catch weak validators (skip if already reflects any).
+    if not result.reflected:
+        for origin, kind in _bypass_origins(url):
+            try:
+                r = session.get(url, timeout=timeout, verify=verify, allow_redirects=True,
+                               headers={"Origin": origin})
+            except requests.RequestException:
+                continue
+            got = (r.headers.get("Access-Control-Allow-Origin") or "").strip()
+            if got and (got == origin or (kind == "null" and got.lower() == "null")):
+                result.bypasses.append(CorsBypass(origin, kind, _acac_true(r)))
+
     return result
 
 

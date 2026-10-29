@@ -17,6 +17,7 @@ CLASS_WEIGHT = {
     "csrf": 7,
     "cookie-theft": 6,
     "sensitive-caching": 6,
+    "cookie-integrity": 4,
     "tls-downgrade": 4,
     "clickjacking": 4,
     "mime-sniffing": 4,
@@ -24,7 +25,12 @@ CLASS_WEIGHT = {
     "referrer-leak": 3,
     "xs-leaks": 3,
     "cookie-transport": 3,
+    "permissions-policy": 2,
+    "coep": 2,
+    "corp": 2,
     "info-disclosure": 2,
+    "xss-legacy-filter": 1,
+    "clear-site-data": 1,
 }
 
 STATUS_MULT = {OPEN: 1.0, REVIEW: 0.5, PRECLUDED: 0.0}
@@ -39,8 +45,24 @@ def verdict_score(v: Verdict) -> float:
     return score
 
 
-def endpoint_score(verdicts: list[Verdict]) -> float:
-    return sum(verdict_score(v) for v in verdicts)
+# On a plain-http endpoint these all flip to OPEN from the single fact "no TLS".
+# Counting each would triple-count one root cause, so they are collapsed.
+_TRANSPORT_CLUSTER = {"tls-downgrade", "mixed-content", "cookie-transport"}
+
+
+def endpoint_score(result: Result) -> float:
+    http = result.probe.scheme and result.probe.scheme != "https"
+    total = 0.0
+    cluster: list[float] = []
+    for v in result.verdicts:
+        s = verdict_score(v)
+        if http and v.cls in _TRANSPORT_CLUSTER:
+            cluster.append(s)
+        else:
+            total += s
+    if cluster:
+        total += max(cluster)  # the transport problem counts once, not per-class
+    return total
 
 
 def top_leads(verdicts: list[Verdict], n: int = 3) -> list[str]:
@@ -59,7 +81,7 @@ def top_leads(verdicts: list[Verdict], n: int = 3) -> list[str]:
 
 
 def rank(results: list[Result]) -> list[tuple[Result, float]]:
-    scored = [(r, endpoint_score(r.verdicts)) for r in results]
+    scored = [(r, endpoint_score(r)) for r in results]
     # Errors to the bottom; otherwise by score desc, then URL for stability.
     scored.sort(key=lambda t: (t[0].error is not None, -t[1], t[0].url))
     return scored

@@ -92,9 +92,11 @@ Options:
 | `-k, --insecure` | Do not verify TLS certificates. |
 | `--timeout`    | Per-request timeout, seconds (default 15). |
 
-Two requests are sent per target: the primary request (redirects followed to the
-final response, the hop chain is shown), and a CORS probe that repeats the
-request with a foreign `Origin` to detect reflection / `Allow-Credentials`.
+Per target it sends the primary request (redirects followed to the final
+response, the hop chain is shown) plus a CORS probe: a foreign `Origin` on a
+simple GET (reflection / `Allow-Credentials`), an `OPTIONS` preflight (allowed
+methods / headers), and a short fuzz of crafted origins — `prefix`, `suffix`,
+`unescaped-dot`, `null` — to catch weak Origin-validation regexes.
 
 ### Priority map
 
@@ -139,27 +141,41 @@ one response:
 
 ## Header → class map (the rule base)
 
-| Header | Class(es) it can decide |
+19 attack classes, one rule function each ([`checks.py`](preclude/checks.py)):
+
+| Header(s) / signal | Class(es) it can decide |
 |--------|-------------------------|
 | `X-Frame-Options`, CSP `frame-ancestors` | clickjacking |
 | `X-Content-Type-Options: nosniff` | mime-sniffing |
-| CSP `script-src`/`default-src` | xss (mitigation only — never *precluded*) |
+| CSP `script-src`/`default-src`, `object-src`, `base-uri`, `form-action` | xss (mitigation only — never *precluded*) |
 | `Set-Cookie` `SameSite` | csrf |
-| `Access-Control-Allow-Origin` (+ `-Credentials`) | cors |
+| `Access-Control-Allow-Origin` (+ `-Credentials`), preflight, Origin fuzz | cors |
 | `Set-Cookie` `HttpOnly` | cookie-theft (via XSS) |
 | `Set-Cookie` `Secure` | cookie-transport |
+| `Set-Cookie` `__Host-` / `__Secure-` prefixes | cookie-integrity (fixation) |
 | `Strict-Transport-Security` | tls-downgrade |
 | CSP `upgrade-insecure-requests` / `block-all-mixed-content` | mixed-content |
 | `Referrer-Policy` | referrer-leak |
 | `Cross-Origin-Opener-Policy` | xs-leaks / tabnabbing |
+| `Cross-Origin-Embedder-Policy` | coep (cross-origin isolation) |
+| `Cross-Origin-Resource-Policy` | corp |
+| `Permissions-Policy` (+ legacy `Feature-Policy`) | permissions-policy (feature abuse) |
+| `X-XSS-Protection` | xss-legacy-filter |
+| `Clear-Site-Data` | clear-site-data (logout hygiene) |
 | `Server`, `X-Powered-By`, `X-AspNet*` | info-disclosure |
 | `Cache-Control` | sensitive-caching |
 
+The CSP analysis parses directives and judges `script-src` (`unsafe-inline` /
+`unsafe-eval` / wildcard / JSONP-CDN bypass hosts, honouring `strict-dynamic` +
+nonce/hash), plus `object-src` / `base-uri` / `form-action`. The CORS probe adds
+an `OPTIONS` preflight and crafted-origin fuzzing (prefix / suffix / unescaped-dot
+/ null) to surface weak Origin validation.
+
 Notes baked into the engine: CSP never *precludes* XSS (only raises cost);
 `Content-Security-Policy-Report-Only` enforces nothing (always REVIEW);
-`X-Frame-Options: ALLOW-FROM` and `X-XSS-Protection` are obsolete and not
-treated as protection; a reflected CORS origin with credentials is flagged as
-likely exploitable rather than as a control.
+`X-Frame-Options: ALLOW-FROM` is obsolete; `X-XSS-Protection` is treated as a
+legacy artefact, not a protection; a reflected or crafted CORS origin with
+credentials is flagged as likely exploitable rather than as a control.
 
 ## Layout
 
