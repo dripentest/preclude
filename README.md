@@ -1,8 +1,10 @@
 # Preclude
 
-Scan a single endpoint's **security response headers** and preclude the attack
-classes that cannot work there — so you stop testing what the headers already
-rule out and focus on what's actually reachable.
+Scan an endpoint's **security response headers** and preclude the attack classes
+that cannot work there — so you stop testing what the headers already rule out
+and focus on what's actually reachable. Point it at one URL for a full report, or
+at a list of URLs (or a feroxbuster run) for a ranked **priority map** of where
+to test first.
 
 Preclude only reasons about classes that response headers carry real signal
 about (browser-/client-enforced ones). It deliberately says nothing about
@@ -12,7 +14,7 @@ never printed.
 
 ## Install
 
-Clone and run straight away — the only dependency is `requests`:
+Python 3.10+. Clone and run straight away — the only dependency is `requests`:
 
 ```bash
 git clone https://github.com/dripentest/preclude.git
@@ -39,6 +41,27 @@ One endpoint — full report:
 
 ```bash
 preclude scan https://target.example/api/v1/user
+```
+
+```
+target   https://target.example/api/v1/user
+method   GET (+ CORS probe with foreign Origin)
+final    200  [https://target.example/api/v1/user]
+
+PRECLUDED  - ruled out by headers on this endpoint; skip
+  clickjacking       X-Frame-Options: DENY
+  mime-sniffing      X-Content-Type-Options: nosniff
+  tls-downgrade      Strict-Transport-Security: max-age=31536000; includeSubDomains (host-wide)
+
+REVIEW     - control present but partial/weak; verify by hand
+  xss                CSP
+                     ^ script-src allows 'unsafe-inline'
+  cors               ACAO reflects Origin + Allow-Credentials: true
+                     ^ likely exploitable: any origin can read authenticated responses
+
+OPEN       - no relevant control present; test normally
+  cookie-theft       cookie without HttpOnly (sid)
+                     ^ readable via document.cookie; session theft possible if XSS exists
 ```
 
 Many endpoints — ranked **priority map** (where to test first). Targets come
@@ -82,9 +105,11 @@ Options:
 
 | Flag | Meaning |
 |------|---------|
-| `-f, --file` | Read targets from a file (one URL per line). |
+| `-f, --file` | Read targets from a file (list / JSON / feroxbuster output). |
 | `-X, --method` | Primary request method (default `GET`). |
 | `-c, --concurrency` | Parallel requests in batch mode (default 10). |
+| `--include-status` | Keep only these status codes from status-bearing input (`200,301` or `2xx`). |
+| `--exclude-status` | Drop these status codes (`4xx,5xx`). |
 | `--json`       | Machine-readable JSON, ranked, instead of text. |
 | `--full`       | In batch mode, also print each full per-endpoint report. |
 | `--no-follow`  | Do not follow redirects; judge the first response. |
@@ -197,3 +222,7 @@ listing it in `ALL_CHECKS`.
 ## Authorized use only
 
 Run this against systems you are authorized to test.
+
+## License
+
+[MIT](LICENSE).
